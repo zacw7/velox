@@ -16,7 +16,6 @@
 
 #include "velox/common/caching/SsdFile.h"
 
-#include <folly/Executor.h>
 #include <folly/portability/SysUio.h>
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Crc.h"
@@ -47,6 +46,27 @@ namespace {
 // Disable 'copy on write' on the given file. Will throw if failed for any
 // reason, including file system not supporting cow feature.
 void disableCow(int32_t fd) {
+#ifdef linux
+  int attr{0};
+  auto res = ioctl(fd, FS_IOC_GETFLAGS, &attr);
+  VELOX_CHECK_EQ(
+      0,
+      res,
+      "ioctl(FS_IOC_GETFLAGS) failed: {}, {}",
+      res,
+      folly::errnoStr(errno));
+  attr |= FS_NOCOW_FL;
+  res = ioctl(fd, FS_IOC_SETFLAGS, &attr);
+  VELOX_CHECK_EQ(
+      0,
+      res,
+      "ioctl(FS_IOC_SETFLAGS, FS_NOCOW_FL) failed: {}, {}",
+      res,
+      folly::errnoStr(errno));
+#endif // linux
+}
+
+void disableFileCow(int32_t fd) {
 #ifdef linux
   int attr{0};
   auto res = ioctl(fd, FS_IOC_GETFLAGS, &attr);
@@ -141,32 +161,18 @@ SsdFile::SsdFile(const Config& config)
       checkpointIntervalBytes_(config.checkpointIntervalBytes),
       executor_(config.executor) {
   process::TraceContext trace("SsdFile::SsdFile");
-  int32_t oDirect = 0;
-#ifdef linux
-  oDirect = FLAGS_ssd_odirect ? O_DIRECT : 0;
-#endif // linux
-  fd_ = open(fileName_.c_str(), O_CREAT | O_RDWR | oDirect, S_IRUSR | S_IWUSR);
-  if (fd_ < 0) {
-    ++stats_.openFileErrors;
-  }
-  // TODO: add fault tolerant handling for open file errors.
-  VELOX_CHECK_GE(
-      fd_,
-      0,
-      "Cannot open or create {}. Error: {}",
-      fileName_,
-      folly::errnoStr(errno));
+  fs_ = filesystems::getFileSystem(fileName_, nullptr);
+  filesystems::FileOptions fileOptions;
+  fileOptions.shouldThrowOnFileAlreadyExists = false;
+  fileOptions.bufferWrite = false;
+  writeDataFile_ = fs_->openFileForWrite(fileName_, fileOptions);
+  readDataFile_ = fs_->openFileForRead(fileName_);
 
-  if (disableFileCow_) {
-    disableCow(fd_);
-  }
-
-  readFile_ = std::make_unique<LocalReadFile>(fd_);
-  const uint64_t size = lseek(fd_, 0, SEEK_END);
+  const uint64_t size = writeDataFile_->size();
   numRegions_ = std::min<int32_t>(size / kRegionSize, maxRegions_);
   fileSize_ = numRegions_ * kRegionSize;
   if ((size % kRegionSize > 0) || (size > numRegions_ * kRegionSize)) {
-    ::ftruncate(fd_, fileSize_);
+    writeDataFile_->truncate(fileSize_);
   }
   // The existing regions in the file are writable.
   writableRegions_.resize(numRegions_);
@@ -177,6 +183,10 @@ SsdFile::SsdFile(const Config& config)
   regionPins_.resize(maxRegions_, 0);
   if (checkpointEnabled()) {
     initializeCheckpoint();
+  }
+
+  if (disableFileCow_) {
+    disableFileCow();
   }
 }
 
@@ -280,7 +290,7 @@ void SsdFile::read(
     uint64_t offset,
     const std::vector<folly::Range<char*>>& buffers) {
   process::TraceContext trace("SsdFile::read");
-  readFile_->preadv(offset, buffers);
+  readDataFile_->preadv(offset, buffers);
 }
 
 std::optional<std::pair<uint64_t, int32_t>> SsdFile::getSpace(
@@ -324,19 +334,23 @@ bool SsdFile::growOrEvictLocked() {
   process::TraceContext trace("SsdFile::growOrEvictLocked");
   if (numRegions_ < maxRegions_) {
     const auto newSize = (numRegions_ + 1) * kRegionSize;
-    const auto rc = ::ftruncate(fd_, newSize);
-    if (rc >= 0) {
+    try {
+      writeDataFile_->truncate(newSize);
       fileSize_ = newSize;
       writableRegions_.push_back(numRegions_);
       regionSizes_[numRegions_] = 0;
       erasedRegionSizes_[numRegions_] = 0;
       ++numRegions_;
+      VELOX_SSD_CACHE_LOG(WARNING)
+          << "Grow " << fileName_ << " to " << numRegions_
+          << " regions (max: " << maxRegions_ << ")";
       return true;
+    } catch (const std::exception& e) {
+      ++stats_.growFileErrors;
+      VELOX_SSD_CACHE_LOG(ERROR)
+          << "Failed to grow cache file " << fileName_ << " to " << newSize
+          << " with error: " << e.what();
     }
-
-    ++stats_.growFileErrors;
-    VELOX_SSD_CACHE_LOG(ERROR)
-        << "Failed to grow cache file " << fileName_ << " to " << newSize;
   }
 
   const auto candidates =
@@ -467,20 +481,21 @@ void SsdFile::write(std::vector<CachePin>& pins) {
 }
 
 bool SsdFile::write(
-    uint64_t offset,
-    uint64_t length,
+    int64_t offset,
+    int64_t length,
     const std::vector<iovec>& iovecs) {
-  const auto ret = folly::pwritev(fd_, iovecs.data(), iovecs.size(), offset);
-  if (ret == length) {
-    return true;
+  try {
+    writeDataFile_->write(iovecs, offset, length);
+  } catch (const std::exception& e) {
+    VELOX_SSD_CACHE_LOG(ERROR)
+        << "Failed to write to SSD, file name: " << fileName_
+        << ", size: " << iovecs.size() << ", offset: " << offset
+        << ", error code: " << errno
+        << ", error string: " << folly::errnoStr(errno);
+    ++stats_.writeSsdErrors;
+    return false;
   }
-  VELOX_SSD_CACHE_LOG(ERROR)
-      << "Failed to write to SSD, file name: " << fileName_ << ", fd: " << fd_
-      << ", size: " << iovecs.size() << ", offset: " << offset
-      << ", error code: " << errno
-      << ", error string: " << folly::errnoStr(errno);
-  ++stats_.writeSsdErrors;
-  return false;
+  return true;
 }
 
 namespace {
@@ -497,8 +512,9 @@ int32_t indexOfFirstMismatch(char* x, char* y, int n) {
 void SsdFile::verifyWrite(AsyncDataCacheEntry& entry, SsdRun ssdRun) {
   process::TraceContext trace("SsdFile::verifyWrite");
   auto testData = std::make_unique<char[]>(entry.size());
-  const auto rc = ::pread(fd_, testData.get(), entry.size(), ssdRun.offset());
-  VELOX_CHECK_EQ(rc, entry.size());
+  const auto rc =
+      readDataFile_->pread(ssdRun.offset(), entry.size(), testData.get());
+  VELOX_CHECK_EQ(rc.size(), entry.size());
   if (entry.tinyData() != nullptr) {
     if (::memcmp(testData.get(), entry.tinyData(), entry.size()) != 0) {
       VELOX_FAIL("bad read back");
@@ -569,9 +585,9 @@ void SsdFile::clear() {
 
 void SsdFile::testingDeleteFile() {
   process::TraceContext trace("SsdFile::testingDeleteFile");
-  if (fd_) {
-    close(fd_);
-    fd_ = 0;
+  if (writeDataFile_) {
+    writeDataFile_->close();
+    writeDataFile_ = nullptr;
   }
   auto rc = unlink(fileName_.c_str());
   if (rc < 0) {
@@ -744,11 +760,10 @@ void SsdFile::checkpoint(bool force) {
     // We schedule the potentially long fsync of the cache file on another
     // thread of the cache write executor, if available. If there is none, we do
     // the sync on this thread at the end.
-    auto fileSync = std::make_shared<AsyncSource<int>>(
-        [fd = fd_]() { return std::make_unique<int>(::fsync(fd)); });
-    if (executor_ != nullptr) {
-      executor_->add([fileSync]() { fileSync->prepare(); });
-    }
+    auto fileSync = std::make_shared<AsyncSource<int>>([this]() {
+      writeDataFile_->flush();
+      return std::make_unique<int>(0);
+    });
 
     std::ofstream state;
     const auto checkpointPath = getCheckpointFilePath();
@@ -803,8 +818,7 @@ void SsdFile::checkpoint(bool force) {
 
     // NOTE: we need to ensure cache file data sync update completes before
     // updating checkpoint file.
-    const auto fileSyncRc = fileSync->move();
-    checkRc(*fileSyncRc, "Sync of cache data file");
+    fileSync->move();
 
     const auto endMarker = kCheckpointEndMarker;
     state.write(asChar(&endMarker), sizeof(endMarker));
@@ -943,18 +957,20 @@ void SsdFile::maybeVerifyChecksum(
   }
 }
 
+void SsdFile::disableFileCow() {
+#ifdef linux
+  const std::unordered_map<std::string, std::string> attributes = {
+      {std::string(LocalWriteFile::Attributes::kNoCow), "true"}};
+  writeDataFile_->setAttributes(attributes);
+#endif // linux
+}
+
 bool SsdFile::testingIsCowDisabled() const {
 #ifdef linux
-  int attr{0};
-  const auto res = ioctl(fd_, FS_IOC_GETFLAGS, &attr);
-  VELOX_CHECK_EQ(
-      0,
-      res,
-      "ioctl(FS_IOC_GETFLAGS) failed: {}, {}",
-      res,
-      folly::errnoStr(errno));
-
-  return (attr & FS_NOCOW_FL) == FS_NOCOW_FL;
+  const auto attributes = writeDataFile_->getAttributes();
+  const auto it =
+      attributes.find(std::string(LocalWriteFile::Attributes::kNoCow));
+  return it != attributes.end() && it->second == "true";
 #else
   return false;
 #endif // linux
