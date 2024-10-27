@@ -492,6 +492,17 @@ bool SsdFile::write(
         << ", size: " << iovecs.size() << ", offset: " << offset
         << ", error code: " << errno
         << ", error string: " << folly::errnoStr(errno);
+    // 1. The file descriptor fd is not valid.
+    // 2. The array of buffers iov is null or has a null pointer in it.
+    // 3. The number of buffers iovcnt is less than 1 or greater than UIO_MAXIOV.
+    // 4. The offset offset is negative or greater than the size of the file.
+    VELOX_SSD_CACHE_LOG(ERROR) << " fd " << "???";
+    VELOX_SSD_CACHE_LOG(ERROR) << " iovecs ";
+    for (const auto iovec :iovecs) {
+      VELOX_SSD_CACHE_LOG(ERROR) << "iov_base == nullptr: " << (iovec.iov_base == nullptr) << " len " << iovec.iov_len;
+    }
+    VELOX_SSD_CACHE_LOG(ERROR) << " iovcnt " <<  iovecs.size();
+    VELOX_SSD_CACHE_LOG(ERROR) << " offset " <<  offset;
     ++stats_.writeSsdErrors;
     return false;
   }
